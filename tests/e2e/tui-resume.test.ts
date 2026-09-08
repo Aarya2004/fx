@@ -289,6 +289,65 @@ async function waitForPersistedSessionMarker(
   }, `persisted session marker ${marker}`, timeout);
 }
 
+test.skipIf(!tmuxAvailable())("suspended sessions retain exclusive writer ownership until close", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fx-foreground-history-"));
+  const home = join(root, "home"), workspace = join(root, "workspace");
+  mkdirSync(home, { mode: 0o700 });
+  mkdirSync(workspace, { mode: 0o700 });
+  const exitPath = join(root, "exit"), stderr = join(root, "stderr.log");
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("FIRST_ACCEPTED_TURN"),
+    fakeGatewayFinalText("AFTER_FOREGROUND_TURN"),
+    fakeGatewayFinalText("COLD_REOPEN_TURN"),
+  ]);
+  const env = { ...gatewayEnv(home, gateway), FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1" };
+  let tui: TmuxSession | undefined;
+  try {
+    const seeded = await runFx(["ask", "--json", "Remember the original turn."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(seeded.code).toBe(0);
+    const id = JSON.parse(seeded.stdout).session_id;
+    const events = join(home, ".fx", "sessions", id, "events.jsonl");
+    const accepted = readFileSync(events);
+    tui = await TmuxSession.create({
+      cmd: "/bin/sh -i", cwd: workspace, isolated: true, remainOnExit: true, width: 110, height: 36,
+      env: { ...env, PS1: "SESSION_SHELL> " },
+    });
+    await tui.waitForText("SESSION_SHELL>", TIMEOUT);
+    await tui.sendText(`${shellQuote(FX_BIN)} --resume ${shellQuote(id)} 2>${shellQuote(stderr)}`);
+    await tui.waitForText("FIRST_ACCEPTED_TURN", TIMEOUT);
+    await tui.waitForStableComposer(TIMEOUT);
+    await tui.sendLiteral("DRAFT_SURVIVES_SUSPENSION");
+    await tui.waitForText("DRAFT_SURVIVES_SUSPENSION", TIMEOUT);
+    await tui.sendKeys("C-z");
+    await tui.waitForPane(pane => /stopped|suspended/i.test(pane), TIMEOUT);
+    const other = await runFx(["ask", "--json", "--resume-id", id, "Must not run while the owner is suspended."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(other.code).toBe(1);
+    expect(JSON.parse(other.stdout).error).toBe("SessionBusy");
+    expect(gateway.requests).toHaveLength(1);
+    expect(readFileSync(events)).toEqual(accepted);
+    await tui.sendText(`fg; printf '%s' "$?" > ${shellQuote(exitPath)}`);
+    await tui.waitForPane(pane => (pane.split("\n").filter(line => /^\s*┃/.test(line)).at(-1) ?? "").includes("DRAFT_SURVIVES_SUSPENSION"), TIMEOUT);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("AFTER_FOREGROUND_TURN", TIMEOUT);
+    await tui.waitForStableComposer(TIMEOUT);
+    expect(gateway.requests.at(-1)?.body).toContain("DRAFT_SURVIVES_SUSPENSION");
+    expect(readFileSync(events).subarray(0, accepted.length).equals(accepted)).toBe(true);
+    expect(await tui.captureFullScrollback()).not.toContain("InvalidTranscriptTransition");
+    await tui.sendText("/quit");
+    await tui.waitForPane(() => existsSync(exitPath), TIMEOUT);
+    expect(readFileSync(exitPath, "utf8")).toBe("0");
+    const cold = await runFx(["ask", "--json", "--resume-id", id, "Read the saved conversation."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(cold.code).toBe(0);
+    expect(gateway.requests.at(-1)?.body).toContain("FIRST_ACCEPTED_TURN");
+    expect(gateway.requests.at(-1)?.body).toContain("AFTER_FOREGROUND_TURN");
+    expect(readFileSync(stderr, "utf8")).toBe("");
+  } finally {
+    await tui?.kill();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 async function waitForSessionPicker(session: TmuxSession): Promise<string> {
   return session.waitForPane(
     (pane) => {
@@ -6810,6 +6869,67 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "latest and picker resume preserve conversations beside incomplete session creation",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-incomplete-creation-")));
+    const home = join(root, "home"), workspace = join(root, "workspace");
+    mkdirSync(home); mkdirSync(workspace);
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("PUBLICATION_SAVED_HISTORY"),
+      fakeGatewayFinalText("LATEST_CONTINUATION_SAVED"),
+      fakeGatewayFinalText("PICKER_CONTINUATION_SAVED"),
+    ]);
+    const env = gatewayEnv(home, gateway);
+    let active: TmuxSession | null = null;
+    try {
+      const seed = await runFx(["ask", "--json", "Save the conversation."], { cwd: workspace, env });
+      expect(seed.code).toBe(0);
+      const id = JSON.parse(seed.stdout).session_id;
+      const sessions = join(home, ".fx", "sessions");
+      const eventsPath = join(sessions, id, "events.jsonl");
+      const before = readFileSync(eventsPath);
+      const metadata = JSON.parse(readFileSync(join(sessions, id, "session.json"), "utf8"));
+      const remnants: Array<[string, string]> = [];
+      for (const failedId of ["temporary-start", "metadata-start", "creating+unpublished"]) {
+        const directory = join(sessions, failedId);
+        mkdirSync(directory, { mode: 0o700 });
+        writeFileSync(join(directory, "session.lock"), "", { mode: 0o600 });
+        const path = join(directory, failedId === "metadata-start" ? "session.json" : ".session.json.tmp.0123456789abcdef0123456789abcdef");
+        const content = failedId === "metadata-start" ? JSON.stringify({ ...metadata, id: failedId }) : "partial metadata";
+        writeFileSync(path, content, { mode: 0o600 });
+        remnants.push([path, content]);
+      }
+      for (const [flag, reply] of [["--resume-last", "LATEST_CONTINUATION_SAVED"], ["-r", "PICKER_CONTINUATION_SAVED"]] as const) {
+        const stderrPath = join(root, `${flag}.stderr`);
+        active = await TmuxSession.create({ cmd: `${shellQuote(FX_BIN)} ${flag}`, cwd: workspace, env, stderrPath, remainOnExit: true });
+        if (flag === "-r") {
+          await active.waitForText("Sessions 1", TIMEOUT);
+          await active.sendKeys("Enter");
+        }
+        await active.waitForText("PUBLICATION_SAVED_HISTORY", TIMEOUT);
+        await active.waitForStableComposer(TIMEOUT);
+        await active.sendText("Continue the saved conversation without tools.");
+        await active.waitForPane((pane) => pane.includes(reply) && hasEmptyComposer(pane), TIMEOUT);
+        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
+        expect(events.filter((event) => event.assistant?.text === reply)).toHaveLength(1);
+        expect(readFileSync(eventsPath).subarray(0, before.length).equals(before)).toBe(true);
+        expect(await active.captureFullScrollback()).not.toContain("FileNotFound");
+        await active.sendText("/quit");
+        await active.waitForPane(() => paneExitMatches(active!.paneStatus(), 0), TIMEOUT);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await active.kill(); active = null;
+      }
+      expect(gateway.requests).toHaveLength(3);
+      expect(gateway.requests[2]!.body).toContain("LATEST_CONTINUATION_SAVED");
+      for (const [path, bytes] of remnants) expect(readFileSync(path, "utf8")).toBe(bytes);
+    } finally {
+      await active?.kill(); gateway.stop(); rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
   "manual compaction keeps earlier small-session messages visible after resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-compacted-display-")));
@@ -7037,3 +7157,113 @@ for (const inspectDetails of [false, true]) {
     TIMEOUT * 2,
   );
 }
+
+
+test.skipIf(!tmuxAvailable())("remembered continuation restores the selected conversation without discovery", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-remembered-resume-")));
+  const home = join(root, "home"), workspace = join(root, "workspace");
+  mkdirSync(home); mkdirSync(workspace);
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("REMEMBERED_A_HISTORY"),
+    fakeGatewayFinalText("REMEMBERED_B_HISTORY"),
+    fakeGatewayFinalText("LATER_A_ACTIVITY"),
+    fakeGatewayFinalText("LATEST_B_ACTIVITY"),
+  ]);
+  const env = gatewayEnv(home, gateway);
+  const bookmark = join(home, ".fx", "continue", createHash("sha256").update(workspace).digest("hex"));
+  let active: TmuxSession | null = null, other: TmuxSession | null = null;
+  let passed = false;
+  async function open(args: string[], label: string) {
+    return TmuxSession.create({
+      cmd: [FX_BIN, ...args].map(shellQuote).join(" "), cwd: workspace,
+      env: { ...env, FX_TRACE_LOG: join(root, label + ".trace"), FX_TRACE_SCOPES: "core,session" },
+      stderrPath: join(root, label + ".stderr"), isolated: true, remainOnExit: true,
+      width: 110, height: 40,
+    });
+  }
+  async function close(tui: TmuxSession) {
+    await tui.sendText("/quit");
+    await tui.waitForPane(() => tui.paneStatus().dead, TIMEOUT);
+    expect(tui.paneStatus().status).toBe(0);
+    await tui.kill();
+  }
+  try {
+    const a = await runFx(["ask", "--json", "Remember conversation A."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(a.code).toBe(0);
+    const aId = JSON.parse(a.stdout).session_id;
+    expect(existsSync(bookmark)).toBe(false);
+    active = await open(["-c"], "missing");
+    await active.waitForPane(() => active!.paneStatus().dead, TIMEOUT);
+    expect(active.paneStatus().status).toBe(1);
+    expect(readFileSync(join(root, "missing.stderr"), "utf8")).toContain("no remembered session");
+    await active.kill(); active = null;
+    active = await open(["--resume", aId], "select-a");
+    await active.waitForText("REMEMBERED_A_HISTORY", TIMEOUT);
+    await active.waitForStableComposer(TIMEOUT);
+    expect(readFileSync(bookmark, "utf8")).toBe(aId + "\n");
+    const b = await runFx(["ask", "--json", "Remember conversation B."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(b.code).toBe(0);
+    const bId = JSON.parse(b.stdout).session_id;
+    other = await open(["--resume", bId], "select-b");
+    await other.waitForText("REMEMBERED_B_HISTORY", TIMEOUT);
+    await other.waitForStableComposer(TIMEOUT);
+    expect(readFileSync(bookmark, "utf8")).toBe(bId + "\n");
+    await active.sendText("Continue the older active conversation without tools.");
+    await active.waitForText("LATER_A_ACTIVITY", TIMEOUT);
+    await active.waitForStableComposer(TIMEOUT);
+    expect(readFileSync(bookmark, "utf8")).toBe(bId + "\n");
+    await close(active); active = null;
+    await close(other); other = null;
+    active = await open(["--resume", aId], "reselect-a");
+    await active.waitForStableComposer(TIMEOUT);
+    expect(readFileSync(bookmark, "utf8")).toBe(aId + "\n");
+    await close(active); active = null;
+    active = await open([], "empty-window");
+    await active.waitForStableComposer(TIMEOUT);
+    await close(active); active = null;
+    expect(readFileSync(bookmark, "utf8")).toBe(aId + "\n");
+    const latest = await runFx(["ask", "--json", "--resume-id", bId, "Update B without tools."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(latest.code).toBe(0);
+    const last = await runFx(["session", "last", "--json"], { cwd: workspace, env });
+    expect(last.code).toBe(0); expect(JSON.parse(last.stdout).id).toBe(bId);
+    const before = statSync(bookmark);
+    active = await open(["-c"], "continue-a");
+    await active.waitForText("LATER_A_ACTIVITY", TIMEOUT);
+    await active.waitForStableComposer(TIMEOUT);
+    expect(readFileSync(bookmark, "utf8")).toBe(aId + "\n");
+    expect(statSync(bookmark).ino).toBe(before.ino);
+    const trace = readFileSync(join(root, "continue-a.trace"), "utf8");
+    expect(trace).not.toContain("mode=workspace_writable_last");
+    expect(trace).not.toContain("session picker catalog loaded");
+    other = await open(["--continue"], "busy");
+    await other.waitForPane(() => other!.paneStatus().dead, TIMEOUT);
+    expect(other.paneStatus().status).toBe(1);
+    expect(readFileSync(join(root, "busy.stderr"), "utf8")).toContain("another fx process");
+    await other.kill(); other = null;
+    await active.sendText("/resume");
+    await active.waitForText("Enter Resume", TIMEOUT);
+    await active.sendLiteralText("Remember conversation B.");
+    await active.waitForText("Sessions 1", TIMEOUT);
+    await active.sendKeys("Enter");
+    await active.waitForStableComposer(TIMEOUT);
+    expect(readFileSync(bookmark, "utf8")).toBe(bId + "\n");
+    await close(active); active = null;
+    expect(gateway.requests).toHaveLength(4);
+    for (const label of ["select-a", "select-b", "reselect-a", "empty-window", "continue-a"]) {
+      expect(readFileSync(join(root, label + ".stderr"), "utf8")).toBe("");
+    }
+    rmSync(bookmark);
+    const fifo = Bun.spawnSync(["mkfifo", bookmark]);
+    expect(fifo.exitCode).toBe(0);
+    active = await open(["-c"], "invalid-bookmark");
+    await active.waitForPane(() => active!.paneStatus().dead, 3000);
+    expect(active.paneStatus().status).toBe(1);
+    expect(readFileSync(join(root, "invalid-bookmark.stderr"), "utf8")).toContain("remembered session ID could not be read");
+    await active.kill(); active = null;
+    passed = true;
+  } finally {
+    await active?.kill(); await other?.kill(); gateway.stop();
+    if (passed) rmSync(root, { recursive: true, force: true });
+    else console.error(`retained remembered-continuation artifacts at ${root}`);
+  }
+}, 150_000);
